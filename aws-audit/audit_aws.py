@@ -72,6 +72,65 @@ PROXMOX_KEYWORDS = [
     "proxmox", "pve", "pmxcfs", "pve-manager", "qemu-server",
 ]
 
+# Bare metal instance types support nested virtualization (KVM/Proxmox)
+# Includes current and recent generations
+BARE_METAL_TYPES = {
+    # 3rd Gen Xeon (Ice Lake) - c7/m7/r7
+    "c7i.metal", "c7i.metal-24xl", "c7i.metal-48xl",
+    "m7i.metal", "m7i.metal-48xl",
+    "r7i.metal", "r7i.metal-48xl",
+
+    # 2nd Gen Xeon (Cascade Lake) - c6i/m6i/r6i
+    "c6i.metal", "c6a.metal",
+    "m6i.metal", "m6a.metal",
+    "r6i.metal", "r6a.metal",
+
+    # Older generations still in use
+    "c5n.metal", "c5zn.metal",
+    "m5.metal", "m5zn.metal",
+    "r5.metal",
+
+    # Storage optimized
+    "i3.metal", "i3en.metal", "i4i.metal",
+
+    # Memory optimized
+    "x2.metal", "z1d.metal",
+
+    # GPU instances (can run Proxmox)
+    "p3.metal", "p4d.metal",
+    "g4dn.metal",
+
+    # Graviton ARM-based (also support nested virt)
+    "a1.metal",
+
+    # Older/Legacy (still risky if in use)
+    "m5n.metal", "r5n.metal",
+}
+
+# Newer bare metal instances warrant extra scrutiny
+HIGH_SPEC_BARE_METAL = {
+    "c8i.metal", "m8i.metal", "r8i.metal",  # Latest Intel
+    "c7i.metal", "m7i.metal", "r7i.metal",  # Current generation
+}
+
+# Indicators of nested virtualization setup
+NESTED_VIRT_INDICATORS = {
+    "/etc/network/interfaces": "Proxmox network config",
+    "/run/network/interfaces.d": "Proxmox dynamic network config",
+    "/etc/network/cloud-interfaces-template": "Proxmox cloud-init template",
+    "vmbr0": "Proxmox virtual bridge (NAT guests)",
+    "vmbr1": "Proxmox virtual bridge (routed guests)",
+    "dnsmasq": "DHCP server for nested guests",
+    "kvm": "KVM hypervisor (nested VMs)",
+    "qemu-system": "QEMU process (nested VMs)",
+}
+
+# Cloud-init scripts that set up Proxmox
+PROXMOX_CLOUD_INIT_URLS = [
+    "thenickdude/proxmox-on-ec2",  # This repo
+    "raw.githubusercontent.com/thenickdude/proxmox-on-ec2",
+]
+
 
 class Findings:
     def __init__(self):
@@ -393,6 +452,80 @@ def _text_mentions_proxmox(text):
     return any(k in lowered for k in PROXMOX_KEYWORDS)
 
 
+def audit_bare_metal_instances(ec2, region, findings: Findings):
+    """Check for bare metal instances that could run Proxmox/nested VMs."""
+    try:
+        paginator = ec2.get_paginator("describe_instances")
+        for page in paginator.paginate():
+            for reservation in page["Reservations"]:
+                for inst in reservation["Instances"]:
+                    inst_id = inst["InstanceId"]
+                    inst_type = inst.get("InstanceType", "")
+                    state = inst["State"]["Name"]
+
+                    if state == "terminated":
+                        continue
+
+                    if inst_type not in BARE_METAL_TYPES:
+                        continue
+
+                    # Bare metal instance found
+                    name_tag = ""
+                    for tag in inst.get("Tags", []):
+                        if tag.get("Key") == "Name":
+                            name_tag = tag.get("Value", "")
+                            break
+
+                    public_ip = inst.get("PublicIpAddress")
+                    is_high_spec = inst_type in HIGH_SPEC_BARE_METAL
+
+                    # Classify the instance
+                    is_prod, sensitivity = AwsAssetClassifier.classify_instance(inst)
+
+                    # Bare metal is inherently suspicious - you need a good reason for it
+                    if is_high_spec:
+                        sev = "MEDIUM"  # High-spec bare metal is rarely justified
+                        desc = (
+                            f"High-specification bare metal instance type '{inst_type}' detected.\n"
+                            f"Bare metal instances are expensive and typically used for:\n"
+                            f"  • Nested hypervisors (Proxmox, KVM, ESXi)\n"
+                            f"  • High-performance workloads (HPC, ML training)\n"
+                            f"  • License-tied software\n"
+                            f"If used for nested virtualization, this bypasses AWS controls and compliance monitoring."
+                        )
+                    else:
+                        sev = "LOW"
+                        desc = (
+                            f"Bare metal instance type '{inst_type}' is running.\n"
+                            f"Bare metal instances support nested virtualization (e.g., Proxmox/KVM).\n"
+                            f"Verify this is for an approved use case (HPC, specialized workload)."
+                        )
+
+                    threat = ThreatContext(
+                        exploit_available=True,  # Metal instances have higher surface area
+                        affected_instances=1,
+                    )
+                    asset = AssetContext(
+                        is_production=is_prod,
+                        data_sensitivity=sensitivity,
+                        has_public_ip=bool(public_ip),
+                    )
+
+                    findings.add(
+                        sev,
+                        "Infrastructure",
+                        f"[{region}] instance:{inst_id} ({name_tag or 'unnamed'})",
+                        desc,
+                        f"Verify bare metal justification: document approved use case, "
+                        f"ensure no unauthorized nested VMs running, and monitor for unusual network activity.",
+                        asset_context=asset,
+                        threat_context=threat,
+                    )
+
+    except ClientError as e:
+        findings.add("INFO", "Infrastructure", f"[{region}] bare-metal-check", f"Could not audit bare metal instances: {e}")
+
+
 def audit_ec2_instances(session, ec2, region, findings: Findings):
     try:
         paginator = ec2.get_paginator("describe_instances")
@@ -416,9 +549,31 @@ def audit_ec2_instances(session, ec2, region, findings: Findings):
 
                     # --- Proxmox detection heuristics ---
                     proxmox_hits = []
+                    nested_virt_evidence = []
+
+                    # 1. Check instance type for bare metal (required for VMs)
+                    inst_type = inst.get("InstanceType", "")
+                    is_bare_metal = any(
+                        inst_type.endswith(".metal") or inst_type == bm
+                        for bm in BARE_METAL_TYPES
+                    )
+                    is_high_spec_bare_metal = inst_type in HIGH_SPEC_BARE_METAL
+
+                    if is_bare_metal:
+                        if is_high_spec_bare_metal:
+                            nested_virt_evidence.append(
+                                f"HIGH-SPEC bare metal instance type '{inst_type}' ⚠️ (perfect for nested VMs, expensive = likely deliberate)"
+                            )
+                        else:
+                            nested_virt_evidence.append(
+                                f"bare metal instance type '{inst_type}' (required for nested VMs with KVM)"
+                            )
+
+                    # 2. Check name/tags for Proxmox
                     if _text_mentions_proxmox(name_tag) or _text_mentions_proxmox(tag_blob):
                         proxmox_hits.append("instance name/tags reference Proxmox")
 
+                    # 3. Check AMI for Proxmox
                     try:
                         image = ec2.describe_images(ImageIds=[image_id])["Images"]
                         if image:
@@ -427,8 +582,9 @@ def audit_ec2_instances(session, ec2, region, findings: Findings):
                             if _text_mentions_proxmox(desc_blob):
                                 proxmox_hits.append(f"AMI '{image_id}' name/description references Proxmox")
                     except ClientError:
-                        pass  # AMI may be shared/marketplace and not describable; not fatal
+                        pass
 
+                    # 4. Check user data for Proxmox cloud-init installation
                     try:
                         user_data_attr = ec2.describe_instance_attribute(
                             InstanceId=inst_id, Attribute="userData"
@@ -437,14 +593,32 @@ def audit_ec2_instances(session, ec2, region, findings: Findings):
                         if ud:
                             import base64
                             decoded = base64.b64decode(ud).decode("utf-8", errors="ignore")
+
+                            # Check for Proxmox keywords
                             if _text_mentions_proxmox(decoded):
-                                proxmox_hits.append("instance user-data / boot script references Proxmox install")
+                                proxmox_hits.append("user-data script references Proxmox install")
+
+                            # Check for specific cloud-init techniques from thenickdude/proxmox-on-ec2
+                            for repo_url in PROXMOX_CLOUD_INIT_URLS:
+                                if repo_url.lower() in decoded.lower():
+                                    nested_virt_evidence.append(
+                                        f"cloud-init script from '{repo_url}' (nested Proxmox VE installation)"
+                                    )
+                                    proxmox_hits.append("detected cloud-init from proxmox-on-ec2 repo")
+
+                            # Check for Proxmox package installation commands
+                            if any(x in decoded.lower() for x in ["pve-manager", "proxmox-ve", "apt install proxmox"]):
+                                nested_virt_evidence.append("cloud-init explicitly installs Proxmox packages")
+
+                            # Check for network bridge setup (vmbr0 = nested guests)
+                            if any(x in decoded.lower() for x in ["vmbr0", "vmbr1", "bridge-ports"]):
+                                nested_virt_evidence.append("cloud-init configures virtual bridges (vmbr0/vmbr1) for nested guests")
                     except ClientError:
                         pass
 
-                    # Security groups on this instance -> is Proxmox web GUI port (8006) open?
+                    # 5. Check security groups for Proxmox ports and network exposure
                     sg_ids = [sg["GroupId"] for sg in inst.get("SecurityGroups", [])]
-                    proxmox_port_open = False
+                    proxmox_ports_open = {}
                     if sg_ids:
                         try:
                             sgs = ec2.describe_security_groups(GroupIds=sg_ids)["SecurityGroups"]
@@ -452,15 +626,34 @@ def audit_ec2_instances(session, ec2, region, findings: Findings):
                                 for perm in sg.get("IpPermissions", []):
                                     from_port = perm.get("FromPort")
                                     to_port = perm.get("ToPort")
-                                    if from_port is not None and from_port <= 8006 <= (to_port or from_port):
-                                        proxmox_port_open = True
+                                    proto = perm.get("IpProtocol", "")
+                                    if from_port is None:
+                                        continue
+
+                                    # Check for Proxmox-specific ports
+                                    for port, label in SENSITIVE_PORTS.items():
+                                        if port in (8006, 8007, 3128):  # Proxmox ports
+                                            if from_port <= port <= (to_port or from_port):
+                                                proxmox_ports_open[port] = label
                         except ClientError:
                             pass
-                    if proxmox_port_open:
-                        proxmox_hits.append("security group exposes port 8006 (Proxmox VE web GUI default port)")
 
-                    if proxmox_hits:
-                        sev = "CRITICAL" if public_ip else "HIGH"
+                    if proxmox_ports_open:
+                        ports_str = ", ".join(
+                            f"{p} ({l})" for p, l in proxmox_ports_open.items()
+                        )
+                        proxmox_hits.append(f"security group exposes Proxmox ports: {ports_str}")
+
+                    if proxmox_hits or nested_virt_evidence:
+                        # Determine severity
+                        if nested_virt_evidence and public_ip:
+                            sev = "CRITICAL"  # Confirmed nested virt + public exposure
+                        elif nested_virt_evidence:
+                            sev = "CRITICAL"  # Confirmed nested virt even if private
+                        elif public_ip:
+                            sev = "CRITICAL"  # Proxmox ports exposed to internet
+                        else:
+                            sev = "HIGH"
 
                         # Proxmox on production = extremely high risk
                         is_prod, sensitivity = AwsAssetClassifier.classify_instance(inst)
@@ -476,13 +669,28 @@ def audit_ec2_instances(session, ec2, region, findings: Findings):
                             instance_count=1,
                         )
 
+                        # Build detailed description
+                        description_parts = ["Possible unauthorized/unmanaged Proxmox VE deployment detected:"]
+                        if nested_virt_evidence:
+                            description_parts.append("NESTED VIRTUALIZATION CONFIRMED:")
+                            for evidence in nested_virt_evidence:
+                                description_parts.append(f"  • {evidence}")
+                        if proxmox_hits:
+                            description_parts.append("INDICATORS:")
+                            for hit in proxmox_hits:
+                                description_parts.append(f"  • {hit}")
+                        if public_ip:
+                            description_parts.append(f"  ⚠ Instance has PUBLIC IP: {public_ip}")
+
+                        description = "\n".join(description_parts)
+
                         findings.add(sev, "Proxmox", f"[{region}] instance:{inst_id} ({name_tag or 'unnamed'})",
-                                     "Possible unauthorized/unmanaged Proxmox VE deployment detected: "
-                                     + "; ".join(proxmox_hits) + (". Instance has a PUBLIC IP." if public_ip else "."),
+                                     description,
                                      "Verify this is an approved/sanctioned deployment. Nested hypervisors on cloud "
-                                     "instances are frequently unsanctioned shadow-IT, may violate cloud provider "
-                                     "nested-virtualization/licensing terms, and can bypass central patching, "
-                                     "logging, and network controls. Investigate and remove/isolate if unapproved.",
+                                     "instances frequently indicate shadow-IT, may violate cloud provider licensing, "
+                                     "and can bypass central patching, logging, and network controls. If unauthorized, "
+                                     "isolate, audit all nested guests, and remove. If authorized, enforce strict "
+                                     "monitoring and security policies on nested workloads.",
                                      asset_context=asset,
                                      threat_context=threat)
 
@@ -556,6 +764,7 @@ def main():
     print(f"\n[3/3] Auditing EC2 instances (incl. Proxmox detection) in region(s): {regions}")
     for region in regions:
         ec2 = session.client("ec2", region_name=region)
+        audit_bare_metal_instances(ec2, region, findings)
         audit_ec2_instances(session, ec2, region, findings)
 
     report = findings.sorted()
