@@ -19,6 +19,7 @@ import argparse
 import datetime
 import json
 import sys
+from pathlib import Path
 
 try:
     import boto3
@@ -26,6 +27,22 @@ try:
 except ImportError:
     print("ERROR: boto3 is required. Install with: pip install boto3")
     sys.exit(1)
+
+# Import risk scorer and classifiers from parent directory
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from risk_scorer import RiskScorer, AssetContext, DataSensitivity, ThreatContext
+from asset_classifier import AwsAssetClassifier
+from threat_intel import ThreatIntel
+
+# Reports directory
+REPORTS_DIR = Path(__file__).parent.parent / "reports"
+
+# Threat intelligence (initialize with API keys from env if available)
+import os
+THREAT_INTEL = ThreatIntel(
+    nvd_api_key=os.getenv("NVD_API_KEY"),
+    shodan_api_key=os.getenv("SHODAN_API_KEY"),
+)
 
 
 # ---------------------------------------------------------------------------
@@ -59,18 +76,34 @@ PROXMOX_KEYWORDS = [
 class Findings:
     def __init__(self):
         self.items = []
+        self.scorer = RiskScorer()
 
-    def add(self, severity, category, resource, description, remediation=""):
+    def add(
+        self,
+        severity,
+        category,
+        resource,
+        description,
+        remediation="",
+        asset_context=None,
+        threat_context=None,
+    ):
+        risk_score = self.scorer.score(severity, asset_context, threat_context)
         self.items.append({
             "severity": severity,
             "category": category,
             "resource": resource,
             "description": description,
             "remediation": remediation,
+            "risk_score": risk_score,
         })
 
     def sorted(self):
-        return sorted(self.items, key=lambda f: SEVERITY_ORDER.get(f["severity"], 9))
+        # Sort by risk_score desc, then severity
+        return sorted(
+            self.items,
+            key=lambda f: (-f.get("risk_score", 0), SEVERITY_ORDER.get(f["severity"], 9)),
+        )
 
 
 def get_session(profile, region):
@@ -255,6 +288,10 @@ def audit_security_groups(ec2, region, findings: Findings):
             for sg in page["SecurityGroups"]:
                 sg_id = sg["GroupId"]
                 sg_name = sg.get("GroupName", sg_id)
+
+                # Classify SG by tags
+                is_prod, sensitivity = AwsAssetClassifier.classify_sg(sg)
+
                 for perm in sg.get("IpPermissions", []):
                     if not _rule_is_open_to_world(perm):
                         continue
@@ -263,9 +300,15 @@ def audit_security_groups(ec2, region, findings: Findings):
                     proto = perm.get("IpProtocol")
 
                     if proto == "-1" or (from_port == 0 and to_port == 65535):
+                        asset = AssetContext(
+                            is_production=is_prod,
+                            data_sensitivity=sensitivity,
+                            has_public_ip=True,  # NACL/SG is public
+                        )
                         findings.add("CRITICAL", "Network", f"[{region}] sg:{sg_name}({sg_id})",
                                      "Security group allows ALL protocols/ports inbound from 0.0.0.0/0 (or ::/0).",
-                                     "Restrict ingress to specific ports/protocols and known source ranges.")
+                                     "Restrict ingress to specific ports/protocols and known source ranges.",
+                                     asset_context=asset)
                         continue
 
                     if from_port is None:
@@ -275,9 +318,24 @@ def audit_security_groups(ec2, region, findings: Findings):
                     for port, label in SENSITIVE_PORTS.items():
                         if port in port_range:
                             sev = "CRITICAL" if port in (22, 3389, 8006) else "HIGH"
+
+                            # Get threat intel for this port
+                            threat = ThreatContext(
+                                exploit_available=True,  # Common ports always have exploits
+                                active_exploitation=THREAT_INTEL.shodan.is_port_commonly_scanned(port),
+                                affected_instances=1,
+                            )
+                            asset = AssetContext(
+                                is_production=is_prod,
+                                data_sensitivity=sensitivity,
+                                has_public_ip=True,
+                            )
+
                             findings.add(sev, "Network", f"[{region}] sg:{sg_name}({sg_id})",
                                          f"Port {port} ({label}) is open to the entire internet (0.0.0.0/0).",
-                                         f"Restrict {label} access to a specific IP range, bastion host, or VPN/SSM.")
+                                         f"Restrict {label} access to a specific IP range, bastion host, or VPN/SSM.",
+                                         asset_context=asset,
+                                         threat_context=threat)
     except ClientError as e:
         findings.add("INFO", "Network", f"[{region}] security-groups", f"Could not audit security groups: {e}")
 
@@ -403,24 +461,59 @@ def audit_ec2_instances(session, ec2, region, findings: Findings):
 
                     if proxmox_hits:
                         sev = "CRITICAL" if public_ip else "HIGH"
+
+                        # Proxmox on production = extremely high risk
+                        is_prod, sensitivity = AwsAssetClassifier.classify_instance(inst)
+                        threat = ThreatContext(
+                            exploit_available=True,  # Proxmox has known vulns
+                            active_exploitation=True,  # Actively targeted by attackers
+                            affected_instances=1,
+                        )
+                        asset = AssetContext(
+                            is_production=is_prod,
+                            data_sensitivity=sensitivity,
+                            has_public_ip=public_ip,
+                            instance_count=1,
+                        )
+
                         findings.add(sev, "Proxmox", f"[{region}] instance:{inst_id} ({name_tag or 'unnamed'})",
                                      "Possible unauthorized/unmanaged Proxmox VE deployment detected: "
                                      + "; ".join(proxmox_hits) + (". Instance has a PUBLIC IP." if public_ip else "."),
                                      "Verify this is an approved/sanctioned deployment. Nested hypervisors on cloud "
                                      "instances are frequently unsanctioned shadow-IT, may violate cloud provider "
                                      "nested-virtualization/licensing terms, and can bypass central patching, "
-                                     "logging, and network controls. Investigate and remove/isolate if unapproved.")
+                                     "logging, and network controls. Investigate and remove/isolate if unapproved.",
+                                     asset_context=asset,
+                                     threat_context=threat)
 
                     # --- General instance hygiene checks ---
                     if inst.get("MetadataOptions", {}).get("HttpTokens") != "required":
+                        is_prod, sensitivity = AwsAssetClassifier.classify_instance(inst)
+                        threat = ThreatContext(
+                            exploit_available=True,  # SSRF is a known attack path
+                            active_exploitation=True,  # Actively exploited in cloud
+                        )
+                        asset = AssetContext(
+                            is_production=is_prod,
+                            data_sensitivity=sensitivity,
+                            has_public_ip=public_ip,
+                        )
                         findings.add("MEDIUM", "EC2", f"[{region}] instance:{inst_id} ({name_tag or 'unnamed'})",
                                      "Instance Metadata Service v2 (IMDSv2) is NOT enforced (HttpTokens != required).",
-                                     "Set IMDSv2 to required to mitigate SSRF-based credential theft.")
+                                     "Set IMDSv2 to required to mitigate SSRF-based credential theft.",
+                                     asset_context=asset,
+                                     threat_context=threat)
 
                     if inst.get("Monitoring", {}).get("State") != "enabled":
+                        is_prod, sensitivity = AwsAssetClassifier.classify_instance(inst)
+                        asset = AssetContext(
+                            is_production=is_prod,
+                            data_sensitivity=sensitivity,
+                        )
                         findings.add("LOW", "EC2", f"[{region}] instance:{inst_id} ({name_tag or 'unnamed'})",
                                      "Detailed CloudWatch monitoring is not enabled.",
-                                     "Enable detailed monitoring for better visibility into instance behavior.")
+                                     "Enable detailed monitoring for better visibility into instance behavior.",
+                                     asset_context=asset)
 
     except ClientError as e:
         findings.add("INFO", "EC2", f"[{region}] instances", f"Could not audit EC2 instances: {e}")
@@ -471,21 +564,32 @@ def main():
     print(f"AUDIT COMPLETE - {len(report)} finding(s)")
     print("=" * 78)
     for f in report:
-        print(f"\n[{f['severity']}] ({f['category']}) {f['resource']}")
+        risk_score = f.get("risk_score", "?")
+        print(f"\n[{f['severity']}] (Risk: {risk_score}/100) ({f['category']}) {f['resource']}")
         print(f"  {f['description']}")
         if f["remediation"]:
             print(f"  -> {f['remediation']}")
 
+    # Determine output path (user-specified or auto in reports/ by account)
     if args.output:
-        with open(args.output, "w") as fh:
-            json.dump({
-                "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                "account": ident["Account"],
-                "regions_scanned": regions,
-                "finding_count": len(report),
-                "findings": report,
-            }, fh, indent=2)
-        print(f"\nJSON report written to: {args.output}")
+        output_path = Path(args.output)
+    else:
+        account_id = ident["Account"]
+        REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+        account_dir = REPORTS_DIR / account_id
+        account_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
+        output_path = account_dir / f"audit_{timestamp}.json"
+
+    with open(output_path, "w") as fh:
+        json.dump({
+            "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "account": ident["Account"],
+            "regions_scanned": regions,
+            "finding_count": len(report),
+            "findings": report,
+        }, fh, indent=2)
+    print(f"\nJSON report written to: {output_path}")
 
 
 if __name__ == "__main__":
