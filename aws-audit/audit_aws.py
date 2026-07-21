@@ -1,0 +1,492 @@
+#!/usr/bin/env python3
+"""
+AWS Security Audit Script
+==========================
+Audits an AWS account for common IAM, networking, security group, and EC2
+misconfigurations, and specifically flags evidence of Proxmox VE installs
+running on EC2 instances (unauthorized/shadow hypervisor deployments).
+
+This script is READ-ONLY. It never modifies any AWS resource.
+
+Usage:
+    python3 audit_aws.py [--profile PROFILE] [--region REGION] [--all-regions]
+                         [--output report.json]
+
+See README.md for what is checked and HOW_TO_RUN.md for setup instructions.
+"""
+
+import argparse
+import datetime
+import json
+import sys
+
+try:
+    import boto3
+    from botocore.exceptions import ClientError, NoCredentialsError, ProfileNotFound
+except ImportError:
+    print("ERROR: boto3 is required. Install with: pip install boto3")
+    sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+SEVERITY_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
+
+# Ports that matter for the "sensitive ports open to the world" checks.
+SENSITIVE_PORTS = {
+    22: "SSH",
+    3389: "RDP",
+    3306: "MySQL",
+    5432: "PostgreSQL",
+    1433: "MSSQL",
+    27017: "MongoDB",
+    5900: "VNC",
+    6379: "Redis",
+    9200: "Elasticsearch",
+    # Proxmox VE default ports
+    8006: "Proxmox VE Web GUI",
+    8007: "Proxmox Backup Server",
+    3128: "Proxmox VE SPICE proxy",
+}
+
+PROXMOX_KEYWORDS = [
+    "proxmox", "pve", "pmxcfs", "pve-manager", "qemu-server",
+]
+
+
+class Findings:
+    def __init__(self):
+        self.items = []
+
+    def add(self, severity, category, resource, description, remediation=""):
+        self.items.append({
+            "severity": severity,
+            "category": category,
+            "resource": resource,
+            "description": description,
+            "remediation": remediation,
+        })
+
+    def sorted(self):
+        return sorted(self.items, key=lambda f: SEVERITY_ORDER.get(f["severity"], 9))
+
+
+def get_session(profile, region):
+    try:
+        if profile:
+            return boto3.Session(profile_name=profile, region_name=region)
+        return boto3.Session(region_name=region)
+    except ProfileNotFound as e:
+        print(f"ERROR: {e}")
+        sys.exit(1)
+
+
+def all_regions(session):
+    try:
+        ec2 = session.client("ec2")
+        resp = ec2.describe_regions(AllRegions=False)
+        return [r["RegionName"] for r in resp["Regions"]]
+    except ClientError as e:
+        print(f"WARNING: could not enumerate regions ({e}); falling back to session region only")
+        return [session.region_name]
+
+
+# ---------------------------------------------------------------------------
+# IAM checks (global, not per-region)
+# ---------------------------------------------------------------------------
+
+def audit_iam(session, findings: Findings):
+    iam = session.client("iam")
+
+    # --- Account password policy ---
+    try:
+        policy = iam.get_account_password_policy()["PasswordPolicy"]
+        if not policy.get("RequireUppercaseCharacters") or not policy.get("RequireLowercaseCharacters") \
+           or not policy.get("RequireNumbers") or not policy.get("RequireSymbols"):
+            findings.add("MEDIUM", "IAM", "account-password-policy",
+                         "Password policy does not require a mix of uppercase, lowercase, numbers, and symbols.",
+                         "Tighten the account password policy (IAM > Account Settings).")
+        if policy.get("MaxPasswordAge", 9999) > 90:
+            findings.add("LOW", "IAM", "account-password-policy",
+                         f"Password max age is {policy.get('MaxPasswordAge')} days (>90).",
+                         "Set password expiration to 90 days or fewer.")
+        if policy.get("MinimumPasswordLength", 0) < 14:
+            findings.add("LOW", "IAM", "account-password-policy",
+                         f"Minimum password length is {policy.get('MinimumPasswordLength')} (<14).",
+                         "Require at least 14 characters.")
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "NoSuchEntity":
+            findings.add("HIGH", "IAM", "account-password-policy",
+                         "No account password policy is configured.",
+                         "Configure a password policy under IAM > Account Settings.")
+        else:
+            findings.add("INFO", "IAM", "account-password-policy", f"Could not evaluate: {e}")
+
+    # --- Root account usage / MFA ---
+    try:
+        summary = iam.get_account_summary()["SummaryMap"]
+        if summary.get("AccountMFAEnabled", 0) == 0:
+            findings.add("CRITICAL", "IAM", "root-account",
+                         "MFA is NOT enabled on the root account.",
+                         "Enable MFA (hardware or virtual) on the root account immediately.")
+    except ClientError as e:
+        findings.add("INFO", "IAM", "root-account", f"Could not evaluate root MFA: {e}")
+
+    # Credential report gives root last-used and per-user key/MFA age in one shot
+    try:
+        import csv
+        import io
+        import time
+        iam.generate_credential_report()
+        report = None
+        for _ in range(6):
+            try:
+                report = iam.get_credential_report()
+                break
+            except ClientError:
+                time.sleep(2)
+        if report:
+            csv_text = report["Content"].decode("utf-8")
+            reader = csv.DictReader(io.StringIO(csv_text))
+            now = datetime.datetime.now(datetime.timezone.utc)
+            for row in reader:
+                user = row["user"]
+                if user == "<root_account>":
+                    last_used_str = row.get("password_last_used", "N/A")
+                    if last_used_str not in ("N/A", "no_information", ""):
+                        try:
+                            last_used = datetime.datetime.fromisoformat(last_used_str.replace("Z", "+00:00"))
+                            days = (now - last_used).days
+                            if days < 7:
+                                findings.add("HIGH", "IAM", "root-account",
+                                             f"Root account was used within the last {days} day(s).",
+                                             "Avoid routine use of the root account; use IAM roles/users instead.")
+                        except ValueError:
+                            pass
+                    continue
+
+                # Per-user checks
+                if row.get("password_enabled") == "true" and row.get("mfa_active") == "false":
+                    findings.add("HIGH", "IAM", f"user:{user}",
+                                 "Console password login enabled but MFA is not active.",
+                                 "Require MFA for all console users (enforce via IAM policy/SCP).")
+
+                for key_num in ("1", "2"):
+                    active = row.get(f"access_key_{key_num}_active")
+                    last_rotated = row.get(f"access_key_{key_num}_last_rotated")
+                    if active == "true" and last_rotated not in ("N/A", "", None):
+                        try:
+                            rotated = datetime.datetime.fromisoformat(last_rotated.replace("Z", "+00:00"))
+                            age_days = (now - rotated).days
+                            if age_days > 90:
+                                findings.add("MEDIUM", "IAM", f"user:{user}",
+                                             f"Access key #{key_num} is {age_days} days old (not rotated in 90+ days).",
+                                             "Rotate access keys at least every 90 days; prefer short-lived roles.")
+                        except ValueError:
+                            pass
+
+                    last_used_col = f"access_key_{key_num}_last_used_date"
+                    if active == "true" and row.get(last_used_col) in ("N/A", "no_information", "", None):
+                        findings.add("LOW", "IAM", f"user:{user}",
+                                     f"Access key #{key_num} is active but has never been used.",
+                                     "Deactivate or delete unused access keys.")
+    except Exception as e:
+        findings.add("INFO", "IAM", "credential-report", f"Could not fully parse credential report: {e}")
+
+    # --- Directly-attached high-privilege policies on users ---
+    try:
+        paginator = iam.get_paginator("list_users")
+        for page in paginator.paginate():
+            for user in page["Users"]:
+                uname = user["UserName"]
+                attached = iam.list_attached_user_policies(UserName=uname)["AttachedPolicies"]
+                for pol in attached:
+                    if pol["PolicyName"] in ("AdministratorAccess",) or "Admin" in pol["PolicyName"]:
+                        findings.add("HIGH", "IAM", f"user:{uname}",
+                                     f"User has administrator-level policy '{pol['PolicyName']}' attached directly.",
+                                     "Attach broad permissions to roles/groups, not individual users; apply least privilege.")
+                inline = iam.list_user_policies(UserName=uname)["PolicyNames"]
+                if inline:
+                    findings.add("LOW", "IAM", f"user:{uname}",
+                                 f"User has {len(inline)} inline polic(y/ies): {inline}.",
+                                 "Prefer managed policies attached to groups/roles for auditability.")
+    except ClientError as e:
+        findings.add("INFO", "IAM", "users", f"Could not list users: {e}")
+
+    # --- Roles with overly permissive trust policies ---
+    try:
+        paginator = iam.get_paginator("list_roles")
+        for page in paginator.paginate():
+            for role in page["Roles"]:
+                doc = role["AssumeRolePolicyDocument"]
+                stmts = doc.get("Statement", [])
+                if not isinstance(stmts, list):
+                    stmts = [stmts]
+                for stmt in stmts:
+                    principal = stmt.get("Principal", {})
+                    if principal == "*" or principal.get("AWS") == "*":
+                        findings.add("CRITICAL", "IAM", f"role:{role['RoleName']}",
+                                     "Role trust policy allows ANY AWS principal (Principal: \"*\") to assume it.",
+                                     "Restrict the trust policy to specific account IDs/roles/services.")
+    except ClientError as e:
+        findings.add("INFO", "IAM", "roles", f"Could not list roles: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Network / Security Group checks (per region)
+# ---------------------------------------------------------------------------
+
+def _rule_is_open_to_world(ip_permission):
+    for ip_range in ip_permission.get("IpRanges", []):
+        if ip_range.get("CidrIp") in ("0.0.0.0/0",):
+            return True
+    for ip_range in ip_permission.get("Ipv6Ranges", []):
+        if ip_range.get("CidrIpv6") in ("::/0",):
+            return True
+    return False
+
+
+def audit_security_groups(ec2, region, findings: Findings):
+    try:
+        paginator = ec2.get_paginator("describe_security_groups")
+        for page in paginator.paginate():
+            for sg in page["SecurityGroups"]:
+                sg_id = sg["GroupId"]
+                sg_name = sg.get("GroupName", sg_id)
+                for perm in sg.get("IpPermissions", []):
+                    if not _rule_is_open_to_world(perm):
+                        continue
+                    from_port = perm.get("FromPort")
+                    to_port = perm.get("ToPort")
+                    proto = perm.get("IpProtocol")
+
+                    if proto == "-1" or (from_port == 0 and to_port == 65535):
+                        findings.add("CRITICAL", "Network", f"[{region}] sg:{sg_name}({sg_id})",
+                                     "Security group allows ALL protocols/ports inbound from 0.0.0.0/0 (or ::/0).",
+                                     "Restrict ingress to specific ports/protocols and known source ranges.")
+                        continue
+
+                    if from_port is None:
+                        continue
+
+                    port_range = range(from_port, (to_port or from_port) + 1)
+                    for port, label in SENSITIVE_PORTS.items():
+                        if port in port_range:
+                            sev = "CRITICAL" if port in (22, 3389, 8006) else "HIGH"
+                            findings.add(sev, "Network", f"[{region}] sg:{sg_name}({sg_id})",
+                                         f"Port {port} ({label}) is open to the entire internet (0.0.0.0/0).",
+                                         f"Restrict {label} access to a specific IP range, bastion host, or VPN/SSM.")
+    except ClientError as e:
+        findings.add("INFO", "Network", f"[{region}] security-groups", f"Could not audit security groups: {e}")
+
+
+def audit_vpc_network(ec2, region, findings: Findings):
+    # Default VPC usage (often overlooked / overly permissive by default)
+    try:
+        vpcs = ec2.describe_vpcs()["Vpcs"]
+        for vpc in vpcs:
+            if vpc.get("IsDefault"):
+                findings.add("LOW", "Network", f"[{region}] vpc:{vpc['VpcId']}",
+                             "Default VPC is present/in use.",
+                             "Consider using purpose-built VPCs with deliberate subnet/routing design instead of the default VPC.")
+    except ClientError as e:
+        findings.add("INFO", "Network", f"[{region}] vpcs", f"Could not list VPCs: {e}")
+
+    # NACLs allowing everything
+    try:
+        nacls = ec2.describe_network_acls()["NetworkAcls"]
+        for nacl in nacls:
+            for entry in nacl.get("Entries", []):
+                if entry.get("Egress"):
+                    continue
+                if entry.get("CidrBlock") == "0.0.0.0/0" and entry.get("RuleAction") == "allow" \
+                   and entry.get("Protocol") == "-1":
+                    findings.add("MEDIUM", "Network", f"[{region}] nacl:{nacl['NetworkAclId']}",
+                                 "Network ACL has an inbound ALLOW ALL rule from 0.0.0.0/0.",
+                                 "Scope NACL rules down to only the traffic that is actually required.")
+    except ClientError as e:
+        findings.add("INFO", "Network", f"[{region}] nacls", f"Could not list NACLs: {e}")
+
+    # Public subnets (route to an Internet Gateway)
+    try:
+        route_tables = ec2.describe_route_tables()["RouteTables"]
+        for rt in route_tables:
+            for route in rt.get("Routes", []):
+                if route.get("DestinationCidrBlock") == "0.0.0.0/0" and str(route.get("GatewayId", "")).startswith("igw-"):
+                    assoc_subnets = [a.get("SubnetId") for a in rt.get("Associations", []) if a.get("SubnetId")]
+                    if assoc_subnets:
+                        findings.add("INFO", "Network", f"[{region}] rtb:{rt['RouteTableId']}",
+                                     f"Subnets {assoc_subnets} route 0.0.0.0/0 to an Internet Gateway (public subnet).",
+                                     "Confirm only resources that must be internet-facing live in these subnets.")
+    except ClientError as e:
+        findings.add("INFO", "Network", f"[{region}] route-tables", f"Could not list route tables: {e}")
+
+
+# ---------------------------------------------------------------------------
+# EC2 instance checks, incl. Proxmox detection (per region)
+# ---------------------------------------------------------------------------
+
+def _text_mentions_proxmox(text):
+    if not text:
+        return False
+    lowered = text.lower()
+    return any(k in lowered for k in PROXMOX_KEYWORDS)
+
+
+def audit_ec2_instances(session, ec2, region, findings: Findings):
+    try:
+        paginator = ec2.get_paginator("describe_instances")
+        for page in paginator.paginate():
+            for reservation in page["Reservations"]:
+                for inst in reservation["Instances"]:
+                    inst_id = inst["InstanceId"]
+                    state = inst["State"]["Name"]
+                    if state == "terminated":
+                        continue
+
+                    name_tag = ""
+                    tag_blob = ""
+                    for tag in inst.get("Tags", []):
+                        tag_blob += f"{tag.get('Key','')}={tag.get('Value','')} "
+                        if tag.get("Key") == "Name":
+                            name_tag = tag.get("Value", "")
+
+                    public_ip = inst.get("PublicIpAddress")
+                    image_id = inst.get("ImageId")
+
+                    # --- Proxmox detection heuristics ---
+                    proxmox_hits = []
+                    if _text_mentions_proxmox(name_tag) or _text_mentions_proxmox(tag_blob):
+                        proxmox_hits.append("instance name/tags reference Proxmox")
+
+                    try:
+                        image = ec2.describe_images(ImageIds=[image_id])["Images"]
+                        if image:
+                            img = image[0]
+                            desc_blob = f"{img.get('Name','')} {img.get('Description','')}"
+                            if _text_mentions_proxmox(desc_blob):
+                                proxmox_hits.append(f"AMI '{image_id}' name/description references Proxmox")
+                    except ClientError:
+                        pass  # AMI may be shared/marketplace and not describable; not fatal
+
+                    try:
+                        user_data_attr = ec2.describe_instance_attribute(
+                            InstanceId=inst_id, Attribute="userData"
+                        )
+                        ud = user_data_attr.get("UserData", {}).get("Value")
+                        if ud:
+                            import base64
+                            decoded = base64.b64decode(ud).decode("utf-8", errors="ignore")
+                            if _text_mentions_proxmox(decoded):
+                                proxmox_hits.append("instance user-data / boot script references Proxmox install")
+                    except ClientError:
+                        pass
+
+                    # Security groups on this instance -> is Proxmox web GUI port (8006) open?
+                    sg_ids = [sg["GroupId"] for sg in inst.get("SecurityGroups", [])]
+                    proxmox_port_open = False
+                    if sg_ids:
+                        try:
+                            sgs = ec2.describe_security_groups(GroupIds=sg_ids)["SecurityGroups"]
+                            for sg in sgs:
+                                for perm in sg.get("IpPermissions", []):
+                                    from_port = perm.get("FromPort")
+                                    to_port = perm.get("ToPort")
+                                    if from_port is not None and from_port <= 8006 <= (to_port or from_port):
+                                        proxmox_port_open = True
+                        except ClientError:
+                            pass
+                    if proxmox_port_open:
+                        proxmox_hits.append("security group exposes port 8006 (Proxmox VE web GUI default port)")
+
+                    if proxmox_hits:
+                        sev = "CRITICAL" if public_ip else "HIGH"
+                        findings.add(sev, "Proxmox", f"[{region}] instance:{inst_id} ({name_tag or 'unnamed'})",
+                                     "Possible unauthorized/unmanaged Proxmox VE deployment detected: "
+                                     + "; ".join(proxmox_hits) + (". Instance has a PUBLIC IP." if public_ip else "."),
+                                     "Verify this is an approved/sanctioned deployment. Nested hypervisors on cloud "
+                                     "instances are frequently unsanctioned shadow-IT, may violate cloud provider "
+                                     "nested-virtualization/licensing terms, and can bypass central patching, "
+                                     "logging, and network controls. Investigate and remove/isolate if unapproved.")
+
+                    # --- General instance hygiene checks ---
+                    if inst.get("MetadataOptions", {}).get("HttpTokens") != "required":
+                        findings.add("MEDIUM", "EC2", f"[{region}] instance:{inst_id} ({name_tag or 'unnamed'})",
+                                     "Instance Metadata Service v2 (IMDSv2) is NOT enforced (HttpTokens != required).",
+                                     "Set IMDSv2 to required to mitigate SSRF-based credential theft.")
+
+                    if inst.get("Monitoring", {}).get("State") != "enabled":
+                        findings.add("LOW", "EC2", f"[{region}] instance:{inst_id} ({name_tag or 'unnamed'})",
+                                     "Detailed CloudWatch monitoring is not enabled.",
+                                     "Enable detailed monitoring for better visibility into instance behavior.")
+
+    except ClientError as e:
+        findings.add("INFO", "EC2", f"[{region}] instances", f"Could not audit EC2 instances: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(description="AWS IAM / Network / EC2 security audit, incl. Proxmox detection.")
+    parser.add_argument("--profile", help="AWS CLI profile name to use", default=None)
+    parser.add_argument("--region", help="Single region to scan (default: profile/session default)", default=None)
+    parser.add_argument("--all-regions", action="store_true", help="Scan all enabled regions for network/EC2 checks")
+    parser.add_argument("--output", help="Write JSON report to this file", default=None)
+    args = parser.parse_args()
+
+    session = get_session(args.profile, args.region)
+
+    try:
+        sts = session.client("sts")
+        ident = sts.get_caller_identity()
+        print(f"Authenticated as: {ident['Arn']}  (Account: {ident['Account']})")
+    except (ClientError, NoCredentialsError) as e:
+        print(f"ERROR: could not authenticate to AWS: {e}")
+        sys.exit(1)
+
+    findings = Findings()
+
+    print("\n[1/3] Auditing IAM (global)...")
+    audit_iam(session, findings)
+
+    regions = all_regions(session) if args.all_regions else [session.region_name]
+    print(f"\n[2/3] Auditing networking & security groups in region(s): {regions}")
+    for region in regions:
+        ec2 = session.client("ec2", region_name=region)
+        audit_security_groups(ec2, region, findings)
+        audit_vpc_network(ec2, region, findings)
+
+    print(f"\n[3/3] Auditing EC2 instances (incl. Proxmox detection) in region(s): {regions}")
+    for region in regions:
+        ec2 = session.client("ec2", region_name=region)
+        audit_ec2_instances(session, ec2, region, findings)
+
+    report = findings.sorted()
+
+    print("\n" + "=" * 78)
+    print(f"AUDIT COMPLETE - {len(report)} finding(s)")
+    print("=" * 78)
+    for f in report:
+        print(f"\n[{f['severity']}] ({f['category']}) {f['resource']}")
+        print(f"  {f['description']}")
+        if f["remediation"]:
+            print(f"  -> {f['remediation']}")
+
+    if args.output:
+        with open(args.output, "w") as fh:
+            json.dump({
+                "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "account": ident["Account"],
+                "regions_scanned": regions,
+                "finding_count": len(report),
+                "findings": report,
+            }, fh, indent=2)
+        print(f"\nJSON report written to: {args.output}")
+
+
+if __name__ == "__main__":
+    main()
